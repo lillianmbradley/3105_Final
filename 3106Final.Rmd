@@ -1,0 +1,847 @@
+---
+title: "Thesis"
+author: "Lillian Bradley"
+date: "2025-03-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+\newpage
+
+\newpage
+# Libraries 
+```{r}
+library(ggplot2)
+library(ggmosaic)
+library(dplyr)
+library(readr)
+library(glmmTMB)
+library(ggforce)
+library(readr)
+library(tidyr)
+library(viridis)
+library(cluster)
+library(ggimage)
+library(grid)
+library(png)
+library(xgboost)
+library(caret)
+library(Matrix)
+library(broom)
+library(purrr)
+library(tidyverse)
+library(raster)
+library(vcd)
+library(broom)
+library(pROC)
+library(randomForest)
+```
+
+\newpage
+# Reading in Data
+```{r}
+#accessing data from file on desktop
+base_dir <- "~/Desktop/Baseball/ncaa_trackman/"
+all_files <- list.files(base_dir, recursive = TRUE, full.names = TRUE)
+
+#player positioning data
+player_pos_files <- grep("Robertson Field.*playerpositioning", all_files, value = TRUE)
+player_pos_list <- lapply(player_pos_files, function(file) {
+  df <- read_csv(file, col_types = cols(.default = "c")) 
+  return(df)
+})
+player_pos_all <- bind_rows(player_pos_list)
+head(player_pos_all, 2)
+
+#pitch data
+pitch_files <- setdiff(grep("Robertson Field", all_files, value = TRUE), player_pos_files)
+pitch_list <- lapply(pitch_files, function(file) {
+  df <- read_csv(file, col_types = cols(.default = "c"))  
+  return(df)
+})
+pitch_all <- bind_rows(pitch_list)
+head(pitch_all, 2)
+
+#joining datasets 
+columbia <- pitch_all %>%
+  inner_join(player_pos_all, by = c("GameUID", "PlayID", "PitchUID", "PitcherTeam", "BatterTeam", "PitchCall", "PlayResult")) %>%
+  #filtering data so examining just Columbia's defensive data 
+  filter(PitcherTeam == "COL_LION") %>%
+  dplyr::select(
+    GameUID, PlayID, PitchUID, PAofInning, PitchofPA, Pitcher, PitcherId, PitcherThrows, PitcherTeam, 
+    BatterSide, BatterTeam, Inning, Outs, Balls, Strikes, TaggedPitchType, 
+    PitchCall, KorBB, TaggedHitType, PlayResult, OutsOnPlay, RunsScored, 
+    DetectedShift, 
+    `1B_PositionAtReleaseX`, `1B_PositionAtReleaseZ`, 
+    `2B_PositionAtReleaseX`, `2B_PositionAtReleaseZ`, 
+    `3B_PositionAtReleaseX`, `3B_PositionAtReleaseZ`, 
+    `SS_PositionAtReleaseX`, `SS_PositionAtReleaseZ`, 
+    `LF_PositionAtReleaseX`, `LF_PositionAtReleaseZ`, 
+    `CF_PositionAtReleaseX`, `CF_PositionAtReleaseZ`, 
+    `RF_PositionAtReleaseX`, `RF_PositionAtReleaseZ`
+  )
+
+head(columbia,3)
+
+```
+
+```{r}
+#number of games
+length(unique(columbia$GameUID))
+
+```
+
+
+\newpage
+# Exporatory Data Analysis (EDA)
+```{r}
+#comparing pitcher and batter handedness
+
+#mosaic plot
+ggplot(columbia) +
+  geom_mosaic(aes(x = product(PitcherThrows, BatterSide), fill = BatterSide)) +
+  scale_fill_manual(values = c("Left" = "#012169", "Right" = "#6CACE4")) +  
+  labs(title = "Relationship between Pitcher and Batter Hand - Columbia Baseball @ Home",
+       x = "Pitcher Handedness",
+       y = "Proportion",
+       fill = "Batter Side") +
+  theme_minimal()
+
+
+
+#tacked bar chart
+ggplot(columbia, aes(x = PitcherThrows, fill = BatterSide)) +
+  geom_bar(position = "fill") +  
+  scale_fill_manual(values = c("Left" = "#012169", "Right" = "#6CACE4")) + 
+  labs(title = "Pitcher Hand vs. Batter Hand - Columbia Baseball 2022-2024",
+       x = "Pitcher Handedness",
+       y = "Proportion",
+       fill = "Batter Side") +
+  theme_minimal()
+
+```
+
+```{r}
+#long formatting for easier plotting of positions 
+col_long <- columbia %>%
+  dplyr::select(matches("PositionAtReleaseX|PositionAtReleaseZ")) %>%
+  pivot_longer(cols = everything(), names_to = "Position", values_to = "Coordinate") %>%
+  separate(Position, into = c("Player", "Axis"), sep = "PositionAtRelease") %>%
+  pivot_wider(names_from = Axis, values_from = Coordinate)
+
+head(col_long)
+col_long <- col_long %>%
+  unnest(cols = c(X, Z)) %>%
+  mutate(X = as.numeric(X), Z = as.numeric(Z)) %>%
+  drop_na()
+
+head(col_long)
+```
+Density heat-map showing seven distinct defensive positions. 
+
+
+```{r}
+#loading the field image
+robertson_field_path <- "~/Desktop/Thesis/columbia_field.png"
+robertson_field <- readPNG(robertson_field_path)
+
+
+col_long <- na.omit(col_long)
+
+#adjusting plot limits for better visualization
+x_min <- min(col_long$Z, na.rm = TRUE) - 10
+x_max <- max(col_long$Z, na.rm = TRUE) + 10
+y_min <- min(col_long$X, na.rm = TRUE) - 10
+y_max <- max(col_long$X, na.rm = TRUE) + 10
+
+#setting offset value for alignment 
+offset_x <- 30  
+
+col_long_shifted <- col_long
+col_long_shifted$Z <- col_long_shifted$Z + offset_x  
+
+#plotting heatmap of positions overlaying image of field 
+ggplot(col_long_shifted, aes(x = Z, y = X)) + 
+  annotation_custom(
+    rasterGrob(robertson_field, width = unit(1.5, "npc"), height = unit(1.5, "npc")),
+    xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max
+  ) + 
+  geom_bin2d(bins = 30, alpha = 0.7) + 
+  scale_fill_viridis_c(option = "plasma") + 
+  theme_minimal() +
+  labs(
+    title = "Heatmap of Position Players on Robertson Field (Columbia University)",
+    x = "Z Position (Horizontal)", 
+    y = "X Position (Vertical)"
+  ) + 
+  coord_fixed(ratio = 1)  
+```
+
+heatmap with position specific colors
+```{r}
+col_long_shifted$Position <- factor(col_long_shifted$Player, levels = c("1B_", "2B_", "3B_",
+                                                        "SS_", "LF_", "CF_", "RF_"))
+
+#specifying colors for each position
+pos_colors <- c("1B_" = "pink", "2B_" = "blue", "3B_" = "yellow", "SS_" = "green", 
+                "LF_" = "red", "CF_" = "purple", "RF_" = "orange")
+
+#plotting heatmap of positions overlaying image of field 
+ggplot(col_long_shifted, aes(x = Z, y = X)) + 
+  annotation_custom(
+    rasterGrob(robertson_field, width = unit(1.5, "npc"), height = unit(1.5, "npc")),
+    xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max
+  ) + 
+  geom_bin2d(bins = 30, alpha = 0.7, aes(fill = Position)) +  
+  scale_fill_manual(values = pos_colors) +  
+  theme_minimal() +
+  labs(
+    title = "Colorcoded Heatmap of Position Players on Robertson Field (Columbia University)",
+    x = "Z Position (Horizontal)", 
+    y = "X Position (Vertical)",
+    fill = "Player Position"  
+  ) + 
+  coord_fixed(ratio = 1) 
+```
+
+examining shift 
+```{r}
+shift_play_result_summary <- columbia %>%
+  group_by(DetectedShift, PlayResult) %>%
+  tally() %>%
+  arrange(DetectedShift, PlayResult)
+
+#summary table
+print(shift_play_result_summary)
+
+#barplot
+ggplot(shift_play_result_summary, aes(x = DetectedShift, y = n, fill = PlayResult)) +
+  geom_bar(stat = "identity", position = "stack") +  # Stack the bars
+  theme_minimal() +
+  labs(
+    title = "Play Results by Defensive Shift",
+    x = "Detected Shift",
+    y = "Count of Play Results",
+    fill = "Play Result"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#percent of time out is result from shift
+shift_data <- columbia %>%
+  filter(DetectedShift %in% c("LeftInfieldShift", "RightInfieldShift"))
+
+# Calculate the percentage of "Out" PlayResults when a shift is detected
+out_percentage_when_shifted <- shift_data %>%
+  summarise(percentage_out = mean(PlayResult == "Out") * 100)
+
+print(out_percentage_when_shifted)
+
+#percent of pitches there is a shift
+total_shifts_percentage <- columbia %>%
+  summarise(percentage_with_shift = mean(DetectedShift %in% c("LeftInfieldShift", "RightInfieldShift")) * 100)
+
+print(total_shifts_percentage)
+
+#percent of times theres a hit against shift 
+hits <- c("Single", "Double", "HomeRun", "Triple")
+
+filtered_data <- columbia %>%
+  filter(PlayResult %in% hits)
+
+play_result_percentages <- filtered_data %>%
+  group_by(PlayResult) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = (count / nrow(columbia)) * 100)  
+
+print(play_result_percentages)
+
+ggplot(play_result_percentages, aes(x = PlayResult, y = percentage, fill = PlayResult)) +
+  geom_bar(stat = "identity") +  # Use the actual values (percentage) for the bar heights
+  scale_fill_manual(values = c("Single" = "#003865", "Double" = "#9BCBEB", "HomeRun" = "#BD3039", "Triple" = "#DF4601")) + 
+  theme_minimal() +
+  labs(
+    title = "Hit Type Distrubtion With Defensive Shift Implemented",
+    x = "Play Result",
+    y = "Percentage (%)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_text(aes(label = paste0(count, " (", round(percentage, 1), "%)")), 
+            position = position_stack(vjust = 0.5), size = 4, color = "#FFFFFF")
+
+```
+
+breaking down heatmaps by handedness (batter and pitcher)
+
+preparing data
+```{r}
+col_expanded <- columbia %>% 
+  dplyr::select(PitchUID, PitcherThrows, BatterSide, PlayResult, DetectedShift, matches("PositionAtReleaseX|PositionAtReleaseZ"))
+
+col_expanded <- col_expanded %>%
+  mutate(across(contains("PositionAtRelease"), as.numeric)) %>%
+  drop_na()
+
+head(col_expanded)
+
+col_expanded_long <- col_expanded %>%
+  pivot_longer(cols = matches("PositionAtReleaseX|PositionAtReleaseZ"), names_to = "Position", values_to = "Coordinate") %>%
+  separate(Position, into = c("Player", "Axis"), sep = "PositionAtRelease") %>%
+  pivot_wider(names_from = Axis, values_from = Coordinate)
+
+col_expanded_long <- col_expanded_long %>%
+  unnest(cols = c(X, Z)) %>%
+  mutate(X = as.numeric(X), Z = as.numeric(Z)) %>%
+  drop_na()
+
+head(col_expanded_long)
+
+```
+plotting heatmaps
+```{r}
+#removing undefined
+col_expanded_long <- col_expanded_long %>%
+  filter(PitcherThrows %in% c("Left", "Right"), BatterSide %in% c("Left", "Right"))
+
+#adjusting plot
+x_min <- min(col_expanded_long$Z, na.rm = TRUE) - 10
+x_max <- max(col_expanded_long$Z, na.rm = TRUE) + 10
+y_min <- min(col_expanded_long$X, na.rm = TRUE) - 10
+y_max <- max(col_expanded_long$X, na.rm = TRUE) + 10
+
+
+offset_x <- 30
+
+col_expanded_long$Z <- col_expanded_long$Z + offset_x
+
+#plotting based on handedness
+ggplot(col_expanded_long, aes(x = Z, y = X)) + 
+  annotation_custom(
+    rasterGrob(robertson_field, width = unit(1.75, "npc"), height = unit(1.75, "npc")), 
+    xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max
+  ) + 
+  geom_bin2d(bins = 30, alpha = 0.7) +  
+  scale_fill_viridis_c(option = "plasma") +  
+  facet_grid(PitcherThrows ~ BatterSide) +  
+  theme_minimal() + 
+  labs(
+    title = "Heatmap of Defensive Positioning on Robertson Field (Columbia University)",
+    x = "Batter Handedness (Horizontal)", 
+    y = "Pitcher Handedness (Vertical)",
+    subtitle = "Pitcher Handedness vs Batter Handedness",
+    caption = "Each plot represents the distribution of defensive positioning by handedness."
+  ) +  
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),  
+    plot.title = element_text(size = 16, face = "bold"), 
+    plot.subtitle = element_text(size = 12, face = "italic") 
+  ) + 
+  coord_fixed(ratio = 1)  
+```
+
+
+color coded for positions heatmap with handedness 
+```{r}
+#plotting based on handedness
+ggplot(col_expanded_long, aes(x = Z, y = X)) + 
+  annotation_custom(
+    rasterGrob(robertson_field, width = unit(1.75, "npc"), height = unit(1.75, "npc")), 
+    xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max
+  ) + 
+  #color specific for positions
+  geom_bin2d(bins = 30, alpha = 0.7, aes(fill = Player)) +  
+  scale_fill_manual(values = pos_colors) +  
+  facet_grid(PitcherThrows ~ BatterSide) +  
+  theme_minimal() + 
+  labs(
+    title = "Heatmap of Defensive Positioning on Robertson Field (Columbia University)",
+    x = "Batter Handedness (Horizontal)", 
+    y = "Pitcher Handedness (Vertical)",
+    subtitle = "Pitcher Handedness vs Batter Handedness",
+    caption = "Each plot represents the distribution of defensive positioning by handedness."
+  ) + 
+  theme(
+    strip.text = element_text(size = 12, face = "bold"),  
+    plot.title = element_text(size = 16, face = "bold"),  
+    plot.subtitle = element_text(size = 12, face = "italic")  
+  ) + 
+  coord_fixed(ratio = 1)  
+```
+
+which positions cover the greatest area 
+```{r}
+area_per_position <- col_expanded_long %>%
+  group_by(Player) %>%
+  summarise(
+    min_X = min(X, na.rm = TRUE),
+    max_X = max(X, na.rm = TRUE),
+    min_Z = min(Z, na.rm = TRUE),
+    max_Z = max(Z, na.rm = TRUE),
+    area = (max_X - min_X) * (max_Z - min_Z)
+  ) %>%
+  arrange(desc(area))
+
+print(area_per_position)
+
+#visualizing total area 
+ggplot(area_per_position, aes(x = reorder(Player, area), y = area)) +
+  geom_bar(stat = "identity", fill = "#9BCBEB") +
+  geom_text(aes(label = round(area, 1)), vjust = -0.5, color = "#003865", size = 4, hjust = 1.1) +
+  theme_minimal() +
+  labs(
+    title = "Area Covered by Each Position on the Field",
+    x = "Player Position",
+    y = "Area Covered (Square Units)"
+  ) +
+  coord_flip()
+
+```
+
+# Models
+
+basic model 
+```{r}
+#checking how many pitches there are total 
+cat("\nNumber of pitches:", length(unique(col_expanded$PitchUID)))
+
+#checking how many pitches there are after removing undefined 
+cat("\nNumber of pitches:", 
+    length(unique(col_expanded$PitchUID[col_expanded$PlayResult == "Undefined"])))
+
+col_expanded <- col_expanded %>%
+    filter(PlayResult != "Undefined")
+
+#checking how many pitches there are after removing Undefined results 
+cat("\nNumber of pitches:", length(unique(col_expanded$PitchUID)))
+
+#checking how many pitches resulted in an out
+cat("\nNumber of pitches:", length(unique(col_expanded$PitchUID[col_expanded$PlayResult == "Out"])))
+
+#converting play result to binary, 1 = out, 0 = not out
+col_expanded$PlayResult <- ifelse(col_expanded$PlayResult == "Out", 1, 0)
+
+#converting categorical variables to factors
+col_expanded <- col_expanded %>%
+  mutate(
+    BatterSide = factor(BatterSide),
+    PitcherThrows = factor(PitcherThrows), 
+    DetectedShift = factor(DetectedShift)
+  )
+#printing what data looks like 
+head(col_expanded, 7)
+```
+
+splitting data into training and testing
+```{r}
+set.seed(22)
+train_indices <- sample(1:nrow(col_expanded), size = 0.8 * nrow(col_expanded))
+train_data <- col_expanded[train_indices, ]
+test_data <- col_expanded[-train_indices, ]
+
+dim(train_data)
+dim(test_data)
+```
+
+linear regression models - one for x and one for z
+```{r}
+#logistic regression model to predict PlayResult 
+log_model <- glm(PlayResult ~ 
+                   `1B_PositionAtReleaseX` + `1B_PositionAtReleaseZ` +
+                   `2B_PositionAtReleaseX` + `2B_PositionAtReleaseZ` + 
+                   `3B_PositionAtReleaseX` + `3B_PositionAtReleaseZ` + 
+                   `SS_PositionAtReleaseX` + `SS_PositionAtReleaseZ` + 
+                   `LF_PositionAtReleaseX` + `LF_PositionAtReleaseZ` + 
+                   `CF_PositionAtReleaseX` + `CF_PositionAtReleaseZ` + 
+                   `RF_PositionAtReleaseX` + `RF_PositionAtReleaseZ` + 
+                   BatterSide + PitcherThrows + DetectedShift, 
+                 data = train_data, family = "binomial")
+
+summary(log_model)
+
+#predictions on test data
+pred_probs <- predict(log_model, newdata = test_data, type = "response")
+predictions <- ifelse(pred_probs > 0.5, 1, 0)
+
+#confusion matrix 
+conf_matrix <- table(Predicted = predictions, Actual = test_data$PlayResult)
+print(conf_matrix)
+
+#calculate accuracy
+accuracy <- sum(predictions == test_data$PlayResult) / length(predictions)
+cat("\nAccuracy: ", accuracy)
+
+#roc curve and auc
+roc_curve <- roc(test_data$PlayResult, pred_probs)
+plot(roc_curve, col = "#003865", lwd = 2, main = "ROC Curve for Predicting Outs in Baseball",
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+cat("\nAUC: ", auc(roc_curve))
+
+```
+
+# extreme gradient boost model 
+```{r}
+set.seed(42)
+
+#preparing the fearures  
+train_data_X <- train_data %>%
+  dplyr::select(-PlayResult) %>%
+  mutate(across(everything(), as.numeric))
+test_data_X <- test_data %>%
+  dplyr::select(-PlayResult) %>%
+  mutate(across(everything(), as.numeric))
+
+#converting data into DMatrix format
+dtrain <- xgb.DMatrix(data = as.matrix(train_data_X), label = train_data$PlayResult)
+dtest <- xgb.DMatrix(data = as.matrix(test_data_X), label = test_data$PlayResult)
+```
+
+training model 
+```{r}
+#hyperparams
+params <- list(
+  objective = "reg:squarederror", 
+  booster = "gbtree",            
+  eta = 0.1,                       
+  max_depth = 6,                  
+  nthread = 2                      
+)
+
+#cross-validation to find optimal number of rounds 
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  nfold = 5,
+  stratified = TRUE,
+  early_stopping_rounds = 10,
+  maximize = FALSE,
+  verbose = 1
+)
+
+best_nrounds <- cv_results$best_iteration
+cat("Best number of rounds:", best_nrounds, "\n")
+
+#training final model
+model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  verbose = 1
+)
+```
+
+prediction models on test data 
+```{r}
+#predictions on test set
+pred_probs <- predict(model, dtest)
+
+#converting probabilities to binary predictions (using 0.5 (random) as threshold)
+predictions <- ifelse(pred_probs > 0.5, 1, 0)
+
+#confusion matrix
+conf_matrix_xg <- table(Predicted = predictions, Actual = test_data$PlayResult)
+print(conf_matrix_xg)
+
+#accuracy
+accuracy_xg <- sum(predictions == test_data$PlayResult) / length(predictions)
+cat("\nAccuracy: ", accuracy_xg, "\n")
+
+#ROC curve and AUC
+roc_curve_xg <- roc(test_data$PlayResult, pred_probs)
+plot(roc_curve_xg, col = "#003865", lwd = 2, main = "ROC Curve for Predicting Outs in Baseball",
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+cat("\nAUC: ", auc(roc_curve_xg))
+```
+
+# Random Forest Model
+```{r}
+#setting PlayResult as factor
+train_data$PlayResult <- as.factor(train_data$PlayResult)
+test_data$PlayResult <- as.factor(test_data$PlayResult)
+
+#setting up training control for cross validation
+train_control <- trainControl(method = "cv", number = 5, search = "grid")
+
+#random forest model training 
+rf_grid <- expand.grid(mtry = c(3, 5, 7))  
+
+head(train_data, 2)
+
+rf_model <- train(PlayResult ~ `1B_PositionAtReleaseX` + `1B_PositionAtReleaseZ` + 
+                  `2B_PositionAtReleaseX` + `2B_PositionAtReleaseZ` + 
+                  `3B_PositionAtReleaseX` + `3B_PositionAtReleaseZ` + 
+                  `SS_PositionAtReleaseX` + `SS_PositionAtReleaseZ` + 
+                  `LF_PositionAtReleaseX` + `LF_PositionAtReleaseZ` + 
+                  `CF_PositionAtReleaseX` + `CF_PositionAtReleaseZ` + 
+                  `RF_PositionAtReleaseX` + `RF_PositionAtReleaseZ` +
+                  BatterSide + PitcherThrows + DetectedShift, 
+                data = train_data, 
+                method = "rf", 
+                trControl = train_control, 
+                tuneGrid = rf_grid, 
+                importance = TRUE,
+                family = "binomial")
+
+#best parameters 
+print(rf_model$bestTune)
+summary(rf_model)
+
+```
+
+predictions on test set
+```{r}
+predictions <- predict(rf_model, newdata = test_data)
+pred_probs_rf <- predict(rf_model, newdata = test_data, type = "prob")[, 2]
+
+#confusion matrix
+conf_matrix <- confusionMatrix(predictions, test_data$PlayResult)
+print(conf_matrix)
+
+#accuracy
+accuracy_rf <- sum(predictions == test_data$PlayResult) / length(predictions)
+cat("\nAccuracy: ", accuracy_rf)
+
+#feature importance plot
+varImpPlot(rf_model$finalModel)
+
+#roc and auc
+roc_curve_rf <- roc(test_data$PlayResult, pred_probs_rf)
+plot(roc_curve_rf, col = "#003865", lwd = 2, main = "ROC Curve for Predicting Outs in Baseball Using a Random Forest Model",
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+cat("\nAUC: ", auc(roc_curve))
+```
+
+# comparing the models
+```{r}
+#ROC curves for all models
+plot(roc_curve, col = "#003865", lwd = 2, main = "ROC Curve Comparison", xlab = "False Positive Rate", ylab = "True Positive Rate")
+plot(roc_curve_rf, col = "#9BCBEB", lwd = 2, add = TRUE)
+plot(roc_curve_xg, col = "#bd3039", lwd = 2, add = TRUE)
+legend("bottomright", legend = c("Logistic Regression", "Random Forest", "XGBoost"), col = c("#003865", "#9BCBEB", "#bd3039"), lwd = 2)
+
+```
+
+# final model - xgboost 
+
+## preparing the data 
+```{r}
+train_data$PlayResult <- as.factor(train_data$PlayResult)
+test_data$PlayResult <- as.factor(test_data$PlayResult)
+
+#adding pitcher batter handedness intercation
+train_data$BatterPitcherInteraction <- interaction(train_data$BatterSide, train_data$PitcherThrows)
+test_data$BatterPitcherInteraction <- interaction(test_data$BatterSide, test_data$PitcherThrows)
+
+train_data$PlayResult <- as.numeric(train_data$PlayResult) - 1
+test_data$PlayResult <- as.numeric(test_data$PlayResult) - 1
+
+train_data_X <- train_data %>%
+  dplyr::select(-PlayResult) %>%
+  mutate(across(everything(), as.numeric))
+test_data_X <- test_data %>%
+  dplyr::select(-PlayResult) %>%
+  mutate(across(everything(), as.numeric))
+
+#convert to DMatrix
+dtrain <- xgb.DMatrix(data = as.matrix(train_data_X), label = train_data$PlayResult)
+dtest <- xgb.DMatrix(data = as.matrix(test_data_X), label = test_data$PlayResult)
+
+```
+
+tuning hyperparameters 
+```{r}
+#using grid search to tune hyperparameters 
+params_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1, 0.2),
+  max_depth = c(3, 5, 6, 10),
+  subsample = c(0.6, 0.8, 1),
+  colsample_bytree = c(0.6, 0.8, 1),
+  gamma = c(0, 0.1, 0.2)
+)
+
+#grid search
+for (i in 1:nrow(params_grid)) {
+  params <- list(
+    objective = "binary:logistic",  
+    booster = "gbtree",
+    eta = params_grid$eta[i],
+    max_depth = params_grid$max_depth[i],
+    subsample = params_grid$subsample[i],
+    colsample_bytree = params_grid$colsample_bytree[i],
+    gamma = params_grid$gamma[i],
+    nthread = 2
+  )
+  
+  #cross validation 
+  cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = 1,
+    maximize = FALSE
+  )
+  
+  best_nrounds <- cv_results$best_iteration
+  cat("\nBest number of rounds for params set", i, ":", best_nrounds, "\n")
+}
+
+```
+
+## training final model 
+```{r}
+# Using the best parameters from the grid search
+best_params <- list(
+  objective = "binary:logistic",  
+  booster = "gbtree",
+  eta = 0.1,  
+  max_depth = 5,  
+  subsample = 0.8,
+  colsample_bytree = 1,
+  gamma = 0.1,
+  nthread = 2
+)
+
+# Train the final model using the best nrounds
+final_model <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  verbose = 1
+)
+
+```
+
+# visualizing results and such
+```{r}
+#predictions on test set
+pred_probs_final <- predict(final_model, dtest)
+
+#converting probabilities to binary predictions (using 0.5 (random) as threshold)
+predictions_final <- ifelse(pred_probs_final > 0.5, 1, 0)
+
+#confusion matrix
+conf_matrix_xg_final <- table(Predicted = predictions_final, Actual = test_data$PlayResult)
+print(conf_matrix_xg_final)
+
+#accuracy
+accuracy_xg_final <- sum(predictions == test_data$PlayResult) / length(predictions_final)
+cat("\nAccuracy: ", accuracy_xg_final, "\n")
+
+#ROC curve and AUC
+roc_curve_xg <- roc(test_data$PlayResult, pred_probs_final)
+plot(roc_curve_xg, col = "#003865", lwd = 2, main = "ROC Curve for Predicting Outs in Baseball",
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+cat("\nAUC: ", auc(roc_curve_xg))
+```
+
+# Below Here is the Code I am still wokring on for optimization 
+# finding optimal locations for each player
+
+
+
+```{r}
+#recreate the BatterPitcherInteraction column as a string combination of BatterSide and PitcherThrows
+test_data$BatterPitcherInteraction <- paste(test_data$BatterSide, test_data$PitcherThrows, sep = ".")
+
+find_optimal_positions <- function(batter_side, pitcher_throws) {
+  interaction_label <- paste(batter_side, pitcher_throws, sep = ".")
+  
+  #filtering data based on batter and pitcher handedness
+  test_data_filtered <- test_data[test_data$BatterPitcherInteraction == interaction_label, ]
+  
+  #checking ig filtered data has rows
+  if (nrow(test_data_filtered) == 0) {
+    cat("No data found for Batter:", batter_side, "Pitcher:", pitcher_throws, "\n")
+    return(NULL)  
+  }
+
+  #baseline positions
+  positions <- c(92.64412, 50.53915,  #1B
+                 146.4060, 33.66025,  #2B
+                 108.06077, -90.91847,  #3B
+                 139.1949, -51.55803,  #SS
+                 256.0358, -131.6172,  #LF
+                 305.4376, 7.71895,  #CF
+                 262.6032, 123.60749)  #RF
+  
+  #objective function for optimization
+  optimize_positions <- function(positions) {
+    test_data_optimized <- test_data_filtered
+    
+    #update player positions with the current ones
+    test_data_optimized$X1B <- positions[1]
+    test_data_optimized$Z1B <- positions[2]
+    test_data_optimized$X2B <- positions[3]
+    test_data_optimized$Z2B <- positions[4]
+    test_data_optimized$X3B <- positions[5]
+    test_data_optimized$Z3B <- positions[6]
+    test_data_optimized$XSS <- positions[7]
+    test_data_optimized$ZSS <- positions[8]
+    test_data_optimized$XLF <- positions[9]
+    test_data_optimized$ZLF <- positions[10]
+    test_data_optimized$XCF <- positions[11]
+    test_data_optimized$ZCF <- positions[12]
+    test_data_optimized$XRF <- positions[13]
+    test_data_optimized$ZRF <- positions[14]
+    
+    test_data_optimized <- test_data_optimized[, colnames(train_data)]
+  
+    test_data_optimized[] <- lapply(test_data_optimized, function(x) {
+      if (is.factor(x)) return(as.numeric(as.character(x))) 
+      if (is.logical(x)) return(as.numeric(x))  # TRUE -> 1, FALSE -> 0
+      return(x)
+    })
+    
+    #DMatrix format
+    dtest_optimized <- xgb.DMatrix(data = as.matrix(test_data_optimized))
+    
+    #predictions from the trained model
+    pred_probs_optimized <- predict(final_model, dtest_optimized)
+    
+    #total outs (predictions > 0.5)
+    total_outs <- sum(pred_probs_optimized > 0.5)
+    
+    return(-total_outs)  # Negative for minimization
+  }
+
+  #initial positions vector
+  initial_positions <- positions
+  
+  #apply optimization usingSimulated Annealing
+  result <- optim(
+    par = initial_positions,              
+    fn = optimize_positions,              
+    method = "BFGS",                       
+    control = list(fnscale = -1)          
+  )
+  
+  #optimal positions
+  optimal_positions <- result$par
+  
+  cat("Optimal Positions for Batter:", batter_side, "Pitcher:", pitcher_throws, "\n")
+  cat("1B (X, Z):", optimal_positions[1], optimal_positions[2], "\n")
+  cat("2B (X, Z):", optimal_positions[3], optimal_positions[4], "\n")
+  cat("3B (X, Z):", optimal_positions[5], optimal_positions[6], "\n")
+  cat("SS (X, Z):", optimal_positions[7], optimal_positions[8], "\n")
+  cat("LF (X, Z):", optimal_positions[9], optimal_positions[10], "\n")
+  cat("CF (X, Z):", optimal_positions[11], optimal_positions[12], "\n")
+  cat("RF (X, Z):", optimal_positions[13], optimal_positions[14], "\n")
+  
+  return(optimal_positions)
+}
+
+#Right-handed batter vs Right-handed pitcher
+optimal_positions_right_right <- find_optimal_positions("Right", "Right")
+#Left-handed batter vs Right-handed pitcher
+optimal_positions_left_right <- find_optimal_positions("Left", "Right")
+#Right-handed batter vs Left-handed pitcher
+optimal_positions_right_left <- find_optimal_positions("Right", "Left")
+#Left-handed batter vs Left-handed pitcher
+optimal_positions_left_left <- find_optimal_positions("Left", "Left")
+
+
+```
+
